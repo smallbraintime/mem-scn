@@ -2,43 +2,125 @@ const std = @import("std");
 
 const MemScnError = error{ invalid_pid, posix_err, other };
 
-fn readMemory(pid: usize, start: *anyopaque, size: usize, buf: *anyopaque) !void {
-    _ = size;
-    _ = buf;
+fn processMemory(pid: usize, addr: usize, buf: [*]u8, len: usize) usize {
+    var local: [1]std.posix.iovec = .{.{
+        .base = buf,
+        .len = len,
+    }};
 
-    var file: [64]u8 = undefined;
-    _ = try std.fmt.bufPrint(&file, "/proc/%ld/mem{}", .{pid});
-    const fd = std.posix.open(file, 0, std.os.linux.SHUT.RDWR);
-    if (fd == -1) return MemScnError.posix_err;
+    const remote: [1]std.posix.iovec_const = .{.{
+        .base = @ptrFromInt(addr),
+        .len = len,
+    }};
 
-    if (std.posix.ptrace(std.os.linux.PTRACE.ATTACH, @intCast(pid), 0, 0) == -1) return MemScnError.posix_err;
-    if (std.posix.waitpid(@intCast(pid), 0) == -1) return MemScnError.posix_err;
-
-    const addr: std.posix.off_t = @intCast(start);
-    var mem: [4096]u8 = undefined;
-    try std.posix.pread(fd, &mem, addr);
-
-    if (std.posix.ptrace(std.os.linux.PTRACE.DETACH, @intCast(pid), 0, 0) == -1) return MemScnError.posix_err;
-    std.posix.close(fd);
+    return std.os.linux.process_vm_readv(@intCast(pid), &local, &remote, 0);
 }
 
-fn writeMemory(pid: usize, ptr: *anyopaque, data: *anyopaque) void {
-    var file: [64]u8 = undefined;
-    _ = try std.fmt.bufPrint(&file, "/proc/%ld/mem{}", .{pid});
-    const fd = std.posix.open(file, 0, std.os.linux.SHUT.RDWR);
-    if (fd == -1) return MemScnError.posix_err;
+fn iterMemory(pid: usize, allocator: std.mem.Allocator) !void {
+    const pid_str = try std.fmt.allocPrint(allocator, "/proc/{}/maps", .{pid});
+    defer allocator.free(pid_str);
 
-    if (std.posix.ptrace(std.os.linux.PTRACE.ATTACH, @intCast(pid), 0, 0) == -1) return MemScnError.posix_err;
-    if (std.posix.waitpid(@intCast(pid), 0) == -1) return MemScnError.posix_err;
+    const file = try std.fs.openFileAbsolute(pid_str, .{});
+    defer file.close();
 
-    const addr: std.posix.off_t = @intCast(ptr);
-    if (std.posix.pwrite(fd, data, addr) == -1) return MemScnError.posix_err;
+    var buffered_reader = std.io.bufferedReader(file.reader());
+    var reader = buffered_reader.reader();
 
-    if (std.posix.ptrace(std.os.linux.PTRACE.DETACH, @intCast(pid), 0, 0) == -1) return MemScnError.posix_err;
-    std.posix.close(fd);
+    var line = std.ArrayList(u8).init(allocator);
+    defer line.deinit();
+
+    while (true) {
+        reader.streamUntilDelimiter(line.writer(), '\n', null) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        // std.debug.print("{s}\n", .{line.items});
+
+        const region = try parseMap(line.items);
+        // std.debug.print("start: {}, end: {}, permission: {}\n", .{ region.start, region.end, region.permission });
+
+        if (region.permission == .read) {
+            var buf: [4096]u8 = undefined;
+            var current: usize = region.start;
+
+            while (current < region.end) {
+                var chunk_size = buf.len;
+                if (current + chunk_size > region.end) {
+                    chunk_size = region.end - current;
+                }
+                const bytes_read = processMemory(pid, region.start, &buf, chunk_size);
+                if (bytes_read > buf.len) break;
+
+                if (bytes_read > 0) {
+                    // std.debug.print("{s}\n", .{&buf});
+                    std.debug.print("bytes_read {}\n", .{bytes_read});
+                    std.debug.print("chunk_size {}\n", .{chunk_size});
+                    for (0..bytes_read - 4) |i| {
+                        if (std.mem.eql(u8, buf[i .. i + 4], "play")) {
+                            std.debug.print("value found at address: {}\n", .{region.start + i});
+                        }
+                    }
+                }
+
+                if (bytes_read > 0) {
+                    current += bytes_read;
+                } else {
+                    current += chunk_size;
+                }
+            }
+        }
+
+        line.clearRetainingCapacity();
+    }
 }
 
-fn findPattern() void {}
+const Permission = enum(u8) {
+    read,
+    write,
+    none,
+};
+
+const MemoryRegion = struct {
+    start: usize,
+    end: usize,
+    permission: Permission,
+};
+
+fn parseMap(line: []const u8) !MemoryRegion {
+    var it = std.mem.splitScalar(u8, line, ' ');
+
+    var it2 = std.mem.splitScalar(u8, it.next().?, '-');
+    const start: usize = try std.fmt.parseInt(usize, it2.next().?, 16);
+    const end: usize = try std.fmt.parseInt(usize, it2.next().?, 16);
+
+    var permission: Permission = .none;
+    var it3 = std.mem.splitScalar(u8, it.next().?, ' ');
+    const perm = it3.next().?;
+    for (perm) |c| {
+        switch (c) {
+            'r' => permission = .read,
+            'w' => permission = .write,
+            else => {},
+        }
+    }
+
+    return .{
+        .start = start,
+        .end = end,
+        .permission = permission,
+    };
+}
+
+fn readMemory(pid: usize, data: ?[]const u8) void {
+    _ = pid;
+    _ = data;
+}
+
+fn writeMemory(pid: usize, addr: usize, data: []const u8) void {
+    _ = pid;
+    _ = addr;
+    _ = data;
+}
 
 const Command = union(enum) {
     read_mem: struct {
@@ -115,11 +197,14 @@ const HELP =
 const INVALID = "Invalid command! Try 'mem-scn help' to list available commands\n";
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("memory leak occured");
+
     const command = try parseArgs();
 
     switch (command) {
         .read_mem => |*args| {
-            _ = args;
+            try iterMemory(args.pid, gpa.allocator());
         },
         .write_mem => |*args| {
             _ = args;
