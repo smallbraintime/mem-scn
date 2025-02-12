@@ -1,45 +1,70 @@
 const std = @import("std");
+const pid_t = std.posix.pid_t;
 
-const MemScnError = error{ invalid_pid, posix_err, other };
+const MemScnError = error{
+    InvalidCommand,
+    InvalidPid,
+    InvalidAddress,
+    InvalidData,
+    AddressNotFound,
+    MemoryWriteFailure,
+    FileNotFound,
+    AccessDenied,
+    Other,
+};
 
-fn processMemory(pid: usize, addr: usize, buf: [*]u8, len: usize) usize {
-    var local: [1]std.posix.iovec = .{.{
-        .base = buf,
-        .len = len,
-    }};
+const MemMapsIterator = struct {
+    file: std.fs.File,
+    reader: std.io.BufferedReader(4096, std.fs.File.Reader),
+    line: std.ArrayList(u8),
 
-    const remote: [1]std.posix.iovec_const = .{.{
-        .base = @ptrFromInt(addr),
-        .len = len,
-    }};
+    pub fn init(allocator: std.mem.Allocator, pid: pid_t) MemScnError!MemMapsIterator {
+        const path_pattern = "/proc/{d}/maps";
+        var buf: [std.fmt.count(path_pattern, .{std.math.minInt(pid_t)})]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, path_pattern, .{pid}) catch return MemScnError.Other;
 
-    return std.os.linux.process_vm_readv(@intCast(pid), &local, &remote, 0);
-}
-
-fn iterMemory(pid: usize, allocator: std.mem.Allocator) !void {
-    const pid_str = try std.fmt.allocPrint(allocator, "/proc/{}/maps", .{pid});
-    defer allocator.free(pid_str);
-
-    const file = try std.fs.openFileAbsolute(pid_str, .{});
-    defer file.close();
-
-    var buffered_reader = std.io.bufferedReader(file.reader());
-    var reader = buffered_reader.reader();
-
-    var line = std.ArrayList(u8).init(allocator);
-    defer line.deinit();
-
-    while (true) {
-        reader.streamUntilDelimiter(line.writer(), '\n', null) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return MemScnError.FileNotFound,
+            error.AccessDenied => return MemScnError.AccessDenied,
+            else => return MemScnError.Other,
         };
-        // std.debug.print("{s}\n", .{line.items});
 
-        const region = try parseMap(line.items);
-        // std.debug.print("start: {}, end: {}, permission: {}\n", .{ region.start, region.end, region.permission });
+        const buffered_reader = std.io.bufferedReader(file.reader());
 
-        if (region.permission == .read) {
+        return .{
+            .file = file,
+            .reader = buffered_reader,
+            .line = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *MemMapsIterator) void {
+        self.file.close();
+        self.line.deinit();
+    }
+
+    pub fn next(self: *MemMapsIterator) MemScnError!?MemoryRegion {
+        self.reader.reader().streamUntilDelimiter(self.line.writer(), '\n', null) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return MemScnError.Other,
+        };
+
+        const region = try parseMap(self.line.items);
+
+        self.line.clearRetainingCapacity();
+
+        return region;
+    }
+};
+
+pub fn readMemory(allocator: std.mem.Allocator, pid: pid_t, data: []const u8, results: *std.ArrayList(usize)) MemScnError!bool {
+    var iter = try MemMapsIterator.init(allocator, pid);
+    defer iter.deinit();
+
+    var any_found: bool = false;
+
+    while (try iter.next()) |region| {
+        if (region.permission != .none) {
             var buf: [4096]u8 = undefined;
             var current: usize = region.start;
 
@@ -48,16 +73,15 @@ fn iterMemory(pid: usize, allocator: std.mem.Allocator) !void {
                 if (current + chunk_size > region.end) {
                     chunk_size = region.end - current;
                 }
-                const bytes_read = processMemory(pid, region.start, &buf, chunk_size);
-                if (bytes_read > buf.len) break;
+
+                const bytes_read = processMemory(pid, current, &buf, chunk_size);
+                if (std.os.linux.E.init(bytes_read) != .SUCCESS) break;
 
                 if (bytes_read > 0) {
-                    // std.debug.print("{s}\n", .{&buf});
-                    std.debug.print("bytes_read {}\n", .{bytes_read});
-                    std.debug.print("chunk_size {}\n", .{chunk_size});
-                    for (0..bytes_read - 4) |i| {
-                        if (std.mem.eql(u8, buf[i .. i + 4], "play")) {
-                            std.debug.print("value found at address: {}\n", .{region.start + i});
+                    for (0..bytes_read - data.len) |i| {
+                        if (std.mem.eql(u8, buf[i .. i + data.len], data)) {
+                            any_found = true;
+                            results.append(current + i) catch return MemScnError.Other;
                         }
                     }
                 }
@@ -69,9 +93,64 @@ fn iterMemory(pid: usize, allocator: std.mem.Allocator) !void {
                 }
             }
         }
-
-        line.clearRetainingCapacity();
     }
+
+    return any_found;
+}
+
+fn processMemory(pid: pid_t, addr: usize, buf: [*]u8, len: usize) usize {
+    var local: [1]std.posix.iovec = .{.{
+        .base = buf,
+        .len = len,
+    }};
+
+    const remote: [1]std.posix.iovec_const = .{.{
+        .base = @ptrFromInt(addr),
+        .len = len,
+    }};
+
+    return std.os.linux.process_vm_readv(pid, &local, &remote, 0);
+}
+
+pub fn writeMemory(allocator: std.mem.Allocator, pid: pid_t, addr: usize, data: [:0]const u8) MemScnError!void {
+    var iter = try MemMapsIterator.init(allocator, pid);
+    defer iter.deinit();
+
+    var mregion: ?MemoryRegion = null;
+    while (try iter.next()) |region| {
+        if (region.start <= addr and region.end > addr) {
+            mregion = region;
+            break;
+        }
+    }
+
+    const region = mregion orelse return MemScnError.AddressNotFound;
+
+    if (addr + data.len > region.end) return MemScnError.MemoryWriteFailure;
+
+    const mask: usize = 0xFFF;
+    const address = addr & ~(mask);
+    const slice = @as([*]align(std.mem.page_size) u8, @ptrFromInt(address))[0..std.mem.page_size];
+    if (region.permission != .write) {
+        std.posix.mprotect(slice, std.posix.PROT.WRITE) catch return MemScnError.AccessDenied;
+    }
+
+    defer {
+        if (region.permission != .write) std.posix.mprotect(slice, std.posix.PROT.WRITE) catch unreachable;
+    }
+
+    const local: [1]std.posix.iovec_const = .{.{
+        .base = @ptrCast(data.ptr),
+        .len = data.len,
+    }};
+
+    const remote: [1]std.posix.iovec_const = .{.{
+        .base = @ptrFromInt(addr),
+        .len = data.len,
+    }};
+
+    const result = std.os.linux.process_vm_writev(pid, &local, &remote, 0);
+    if (std.os.linux.E.init(result) != .SUCCESS) return MemScnError.MemoryWriteFailure;
 }
 
 const Permission = enum(u8) {
@@ -86,12 +165,12 @@ const MemoryRegion = struct {
     permission: Permission,
 };
 
-fn parseMap(line: []const u8) !MemoryRegion {
+fn parseMap(line: []const u8) MemScnError!MemoryRegion {
     var it = std.mem.splitScalar(u8, line, ' ');
 
     var it2 = std.mem.splitScalar(u8, it.next().?, '-');
-    const start: usize = try std.fmt.parseInt(usize, it2.next().?, 16);
-    const end: usize = try std.fmt.parseInt(usize, it2.next().?, 16);
+    const start: usize = std.fmt.parseInt(usize, it2.next().?, 16) catch return MemScnError.Other;
+    const end: usize = std.fmt.parseInt(usize, it2.next().?, 16) catch return MemScnError.Other;
 
     var permission: Permission = .none;
     var it3 = std.mem.splitScalar(u8, it.next().?, ' ');
@@ -111,69 +190,62 @@ fn parseMap(line: []const u8) !MemoryRegion {
     };
 }
 
-fn readMemory(pid: usize, data: ?[]const u8) void {
-    _ = pid;
-    _ = data;
-}
-
-fn writeMemory(pid: usize, addr: usize, data: []const u8) void {
-    _ = pid;
-    _ = addr;
-    _ = data;
-}
-
 const Command = union(enum) {
     read_mem: struct {
-        pid: usize,
-        data: ?[]const u8 = null,
+        pid: pid_t,
+        data: [:0]const u8,
     },
     write_mem: struct {
-        pid: usize,
+        pid: pid_t,
         addr: usize,
-        data: []const u8,
+        data: [:0]const u8,
     },
     help: void,
-    invalid: void,
 };
 
-fn parseArgs() !Command {
+fn parseArgs() MemScnError!Command {
     var args = std.process.args();
     _ = args.skip();
 
     if (args.next()) |command| {
         if (std.mem.eql(u8, command, "read")) {
-            var pid: usize = undefined;
+            var pid: pid_t = undefined;
             if (args.next()) |pid_str| {
-                pid = std.fmt.parseInt(usize, pid_str, 10) catch return MemScnError.other;
+                pid = std.fmt.parseInt(pid_t, pid_str, 10) catch return MemScnError.InvalidPid;
             } else {
-                return .invalid;
+                return MemScnError.InvalidPid;
             }
 
-            const data = args.next();
+            var data: [:0]const u8 = undefined;
+            if (args.next()) |d| {
+                data = d;
+            } else {
+                return MemScnError.InvalidData;
+            }
 
             return .{ .read_mem = .{ .pid = pid, .data = data } };
         }
 
         if (std.mem.eql(u8, command, "write")) {
-            var pid: usize = undefined;
+            var pid: pid_t = undefined;
             if (args.next()) |pid_str| {
-                pid = std.fmt.parseInt(usize, pid_str, 10) catch return MemScnError.other;
+                pid = std.fmt.parseInt(pid_t, pid_str, 10) catch return MemScnError.InvalidPid;
             } else {
-                return .invalid;
+                return MemScnError.InvalidPid;
             }
 
             var addr: usize = undefined;
             if (args.next()) |addr_str| {
-                addr = std.fmt.parseInt(usize, addr_str, 10) catch return MemScnError.other;
+                addr = std.fmt.parseInt(usize, addr_str, 10) catch return MemScnError.InvalidAddress;
             } else {
-                return .invalid;
+                return MemScnError.InvalidAddress;
             }
 
-            var data: []const u8 = undefined;
+            var data: [:0]const u8 = undefined;
             if (args.next()) |value| {
                 data = value;
             } else {
-                return .invalid;
+                return MemScnError.InvalidData;
             }
 
             return .{ .write_mem = .{ .pid = pid, .addr = addr, .data = data } };
@@ -182,7 +254,7 @@ fn parseArgs() !Command {
         if (std.mem.eql(u8, command, "help")) return .help;
     }
 
-    return .invalid;
+    return MemScnError.InvalidCommand;
 }
 
 const HELP =
@@ -194,22 +266,49 @@ const HELP =
     \\
 ;
 
-const INVALID = "Invalid command! Try 'mem-scn help' to list available commands\n";
+const INVALID = "Invalid command! Try 'mem-scn help' to list available commands.\n";
+
+fn run(allocator: std.mem.Allocator) MemScnError!void {
+    const command = try parseArgs();
+
+    switch (command) {
+        .read_mem => |*args| {
+            var addrs = std.ArrayList(usize).init(allocator);
+            defer addrs.deinit();
+
+            if (!try readMemory(allocator, args.pid, args.data, &addrs)) {
+                std.debug.print("Memory with given value not found.\n", .{});
+                return;
+            }
+
+            std.debug.print("Value '{s}' found at:\n", .{args.data});
+
+            for (1.., addrs.items) |i, addr| {
+                std.debug.print("{}. {}\n", .{ i, addr });
+            }
+        },
+        .write_mem => |*args| {
+            try writeMemory(allocator, args.pid, args.addr, args.data);
+        },
+        .help => std.debug.print(HELP, .{}),
+    }
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("memory leak occured");
 
-    const command = try parseArgs();
-
-    switch (command) {
-        .read_mem => |*args| {
-            try iterMemory(args.pid, gpa.allocator());
-        },
-        .write_mem => |*args| {
-            _ = args;
-        },
-        .help => std.debug.print(HELP, .{}),
-        .invalid => std.debug.print(INVALID, .{}),
-    }
+    run(gpa.allocator()) catch |err| {
+        switch (err) {
+            MemScnError.InvalidCommand => std.debug.print(INVALID, .{}),
+            MemScnError.InvalidPid => std.debug.print("Invalid Pid.\n", .{}),
+            MemScnError.InvalidAddress => std.debug.print("Invalid Memory Address.\n", .{}),
+            MemScnError.InvalidData => std.debug.print("Invalid Data.\n", .{}),
+            MemScnError.AddressNotFound => std.debug.print("Address Not Found.\n", .{}),
+            MemScnError.MemoryWriteFailure => std.debug.print("Memory Write Failure.\n", .{}),
+            MemScnError.FileNotFound => std.debug.print("Pid Not Found.\n", .{}),
+            MemScnError.AccessDenied => std.debug.print("Access Denied. Try run as a root.\n", .{}),
+            MemScnError.Other => std.debug.print("Something Goes Wrong.\n", .{}),
+        }
+    };
 }
