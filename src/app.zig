@@ -24,7 +24,7 @@ pub fn run(allocator: std.mem.Allocator) MemScnError!void {
             }
 
             if (!try readMemory(allocator, args.pid, value, &addrs)) {
-                std.debug.print("Memory with a given value and type not found.\n", .{});
+                std.debug.print("Memory with the given value and type was not found.\n", .{});
                 return;
             }
 
