@@ -219,6 +219,6 @@ fn strNumToByteArr(type_str: [:0]const u8, value: [:0]const u8) MemScnError!NumB
 }
 
 test "strNumToByteArr" {
-    // try std.testing.expectEqual((try strNumToByteArr("u64", "1234")).value, .{ 0xD2, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
-    // try std.testing.expectError(MemScnError.InvalidValue, strNumToByteArr("u8", "1234"));
+    try std.testing.expectEqual((try strNumToByteArr("u64", "1234")).value, .{ 0xD2, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    try std.testing.expectError(MemScnError.InvalidValue, strNumToByteArr("u8", "1234"));
 }
