@@ -2,9 +2,9 @@ const std = @import("std");
 const common = @import("common.zig");
 const pid_t = common.pid_t;
 const MemScnError = common.MemScnError;
-const MemoryMapsIterator = @import("MemoryMapsIterator.zig");
-const MemoryRegion = MemoryMapsIterator.MemoryRegion;
-const Permission = MemoryMapsIterator.Permission;
+const MemMappingsIterator = @import("MemMappingsIterator.zig");
+const MemoryRegion = MemMappingsIterator.MemoryRegion;
+const Permission = MemMappingsIterator.Permission;
 const mem = @import("mem.zig");
 const readMemory = mem.readMemory;
 const writeMemory = mem.writeMemory;
@@ -49,12 +49,16 @@ pub fn run(allocator: std.mem.Allocator) MemScnError!void {
                 \\Usage: mem-scn <command> [arguments]
                 \\Commands:
                 \\  help                                Display this help message.
+                \\  version                             Display the version of the app.
                 \\  read <pid> <type> <value>           Find memory with a given value and type from process.
                 \\  write <pid> <addr> <type> <value>   Write value with a given type to address in process.
+                \\
+                \\Types: u8, i8, u16, i16, u32, i32, u64, i64, str
                 \\
             ;
             std.debug.print(HELP, .{});
         },
+        .version => std.debug.print("mem-scn 0.1.0\n", .{}),
     }
 }
 
@@ -69,6 +73,7 @@ const Command = union(enum) {
         value: Value,
     },
     help: void,
+    version: void,
 };
 
 const Value = union(enum) {
@@ -133,6 +138,7 @@ fn parseArgs() MemScnError!Command {
         }
 
         if (std.mem.eql(u8, command, "help")) return .help;
+        if (std.mem.eql(u8, command, "version")) return .version;
     }
 
     return MemScnError.InvalidCommand;
@@ -210,4 +216,9 @@ fn strNumToByteArr(type_str: [:0]const u8, value: [:0]const u8) MemScnError!NumB
         return byte_arr;
     }
     return MemScnError.InvalidType;
+}
+
+test "strNumToByteArr" {
+    // try std.testing.expectEqual((try strNumToByteArr("u64", "1234")).value, .{ 0xD2, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    // try std.testing.expectError(MemScnError.InvalidValue, strNumToByteArr("u8", "1234"));
 }

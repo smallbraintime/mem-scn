@@ -2,11 +2,11 @@ const std = @import("std");
 const common = @import("common.zig");
 const pid_t = common.pid_t;
 const MemScnError = common.MemScnError;
-const MemoryMapsIterator = @import("MemoryMapsIterator.zig");
-const MemoryRegion = MemoryMapsIterator.MemoryRegion;
+const MemMappingsIterator = @import("MemMappingsIterator.zig");
+const MemoryRegion = MemMappingsIterator.MemoryRegion;
 
 pub fn readMemory(allocator: std.mem.Allocator, pid: pid_t, value: []const u8, results: *std.ArrayList(usize)) MemScnError!bool {
-    var iter = try MemoryMapsIterator.init(allocator, pid);
+    var iter = try MemMappingsIterator.init(allocator, pid);
     defer iter.deinit();
 
     var any_found: bool = false;
@@ -47,7 +47,7 @@ pub fn readMemory(allocator: std.mem.Allocator, pid: pid_t, value: []const u8, r
 }
 
 pub fn writeMemory(allocator: std.mem.Allocator, pid: pid_t, addr: usize, value: [:0]const u8) MemScnError!void {
-    var iter = try MemoryMapsIterator.init(allocator, pid);
+    var iter = try MemMappingsIterator.init(allocator, pid);
     defer iter.deinit();
 
     var mregion: ?MemoryRegion = null;
@@ -88,4 +88,15 @@ fn processMemory(pid: pid_t, addr: usize, buf: [*]u8, len: usize) usize {
     }};
 
     return std.os.linux.process_vm_readv(pid, &local, &remote, 0);
+}
+
+test "read any mem" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("memory leak occured");
+
+    var results = std.ArrayList(usize).init(gpa.allocator());
+    defer results.deinit();
+
+    try std.testing.expect(try readMemory(gpa.allocator(), 1, "a", &results));
+    try std.testing.expectError(MemScnError.FileNotFound, readMemory(gpa.allocator(), 0, "a", &results));
 }

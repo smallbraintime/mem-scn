@@ -15,13 +15,13 @@ pub const Permission = enum(u8) {
     none,
 };
 
-const MemoryMapsIterator = @This();
+const MemMappingsIterator = @This();
 
 file: std.fs.File,
 reader: std.io.BufferedReader(4096, std.fs.File.Reader),
 line: std.ArrayList(u8),
 
-pub fn init(allocator: std.mem.Allocator, pid: pid_t) MemScnError!MemoryMapsIterator {
+pub fn init(allocator: std.mem.Allocator, pid: pid_t) MemScnError!MemMappingsIterator {
     const path_pattern = "/proc/{d}/maps";
     var buf: [std.fmt.count(path_pattern, .{std.math.minInt(pid_t)})]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, path_pattern, .{pid}) catch return MemScnError.Other;
@@ -41,12 +41,12 @@ pub fn init(allocator: std.mem.Allocator, pid: pid_t) MemScnError!MemoryMapsIter
     };
 }
 
-pub fn deinit(self: *MemoryMapsIterator) void {
+pub fn deinit(self: *MemMappingsIterator) void {
     self.file.close();
     self.line.deinit();
 }
 
-pub fn next(self: *MemoryMapsIterator) MemScnError!?MemoryRegion {
+pub fn next(self: *MemMappingsIterator) MemScnError!?MemoryRegion {
     self.reader.reader().streamUntilDelimiter(self.line.writer(), '\n', null) catch |err| switch (err) {
         error.EndOfStream => return null,
         else => return MemScnError.Other,
@@ -82,4 +82,14 @@ fn parseMap(line: []const u8) MemScnError!MemoryRegion {
         .end = end,
         .permission = permission,
     };
+}
+
+test "read any" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("memory leak occured");
+
+    var iter = try MemMappingsIterator.init(gpa.allocator(), 1);
+    defer iter.deinit();
+
+    try std.testing.expect(try iter.next() != null);
 }
