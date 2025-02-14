@@ -21,7 +21,7 @@ Types: u8, i8, u16, i16, u32, i32, u64, i64, str
 sudo zig build run -- read 1 str some
 ```
 
-### build and run example
+### run tests
 
 ```
 sudo zig build test
