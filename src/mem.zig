@@ -2,11 +2,16 @@ const std = @import("std");
 const common = @import("common.zig");
 const pid_t = common.pid_t;
 const MemScnError = common.MemScnError;
-const MemMappingsIterator = @import("MemMappingsIterator.zig");
-const MemoryRegion = MemMappingsIterator.MemoryRegion;
+const ProcMapsIterator = @import("ProcMapsIterator.zig");
+const MemoryRegion = ProcMapsIterator.MemoryRegion;
 
-pub fn readMemory(allocator: std.mem.Allocator, pid: pid_t, value: []const u8, results: *std.ArrayList(usize)) MemScnError!bool {
-    var iter = try MemMappingsIterator.init(allocator, pid);
+pub fn readMemory(
+    allocator: std.mem.Allocator,
+    pid: pid_t,
+    value: []const u8,
+    results: *std.ArrayList(usize),
+) MemScnError!bool {
+    var iter = try ProcMapsIterator.init(allocator, pid);
     defer iter.deinit();
 
     var any_found: bool = false;
@@ -46,8 +51,13 @@ pub fn readMemory(allocator: std.mem.Allocator, pid: pid_t, value: []const u8, r
     return any_found;
 }
 
-pub fn writeMemory(allocator: std.mem.Allocator, pid: pid_t, addr: usize, value: [:0]const u8) MemScnError!void {
-    var iter = try MemMappingsIterator.init(allocator, pid);
+pub fn writeMemory(
+    allocator: std.mem.Allocator,
+    pid: pid_t,
+    addr: usize,
+    value: [:0]const u8,
+) MemScnError!void {
+    var iter = try ProcMapsIterator.init(allocator, pid);
     defer iter.deinit();
 
     var mregion: ?MemoryRegion = null;
